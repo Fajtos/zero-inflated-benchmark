@@ -1,28 +1,18 @@
 """
 src/models/neural.py
 --------------------
-Neural hurdle model with MLP backbone.
+Neural hurdle model with MLP backbone and multi-seed ensemble.
 
-Architecture:
-    trunk:   Linear(p, h) -> ReLU -> Linear(h, h) -> ReLU
-    head_pi: Linear(h, 1) -> sigmoid     => pi_hat
-    head_mu: Linear(h, 1) -> exp(clip)   => mu_hat
-
-Training objective (hurdle NLL):
-    L = -sum_t [ S_t log(pi_t) + (1-S_t) log(1-pi_t)
-                 + S_t ( y_t log(mu_t) - mu_t
-                        - log(1 - exp(-mu_t))
-                        - lgamma(y_t + 1) ) ]
-
-predicted mean: pi_hat * mu_hat / (1 - exp(-mu_hat))
-predicted pmf : pi_hat * ZTP(mu_hat) with pmf[:, 0] += (1 - pi_hat)
+Stability measures:
+    log_mu clamped to [-6, 4]      caps mu at ~55
+    gradient clipping at norm 5    prevents divergence on steep likelihoods
+    ensemble over 3 seeds          outvotes single-seed training failures
 """
 from __future__ import annotations
 import numpy as np
-from scipy.special import gammaln
 
 from .base import BaseModel
-from .classical import _ztp_pmf, _poisson_pmf
+from .classical import _ztp_pmf
 
 
 def _require_torch():
@@ -32,14 +22,16 @@ def _require_torch():
         return torch, nn
     except Exception as e:
         raise ImportError(
-            "PyTorch is required for neural models. "
-            "Install with: pip install torch"
+            "PyTorch is required for neural models. Install with: pip install torch"
         ) from e
 
 
-class _MLPHurdleModule:
-    """Lazy-constructed PyTorch module. Instantiated inside fit."""
+LOG_MU_MIN = -6.0
+LOG_MU_MAX = 4.0
+GRAD_CLIP = 5.0
 
+
+class _MLPHurdleModule:
     def __init__(self, p_in, hidden):
         torch, nn = _require_torch()
         self.net = nn.Sequential(
@@ -69,7 +61,8 @@ class NeuralHurdle(BaseModel):
     is_hurdle = True
 
     def __init__(self, hidden=64, epochs=200, patience=20,
-                 lr=1e-3, batch=64, val_frac=0.2, seed=0):
+                 lr=1e-3, batch=64, val_frac=0.2, seed=0,
+                 n_ensemble=3):
         self.hidden = hidden
         self.epochs = epochs
         self.patience = patience
@@ -77,6 +70,7 @@ class NeuralHurdle(BaseModel):
         self.batch = batch
         self.val_frac = val_frac
         self.seed = seed
+        self.n_ensemble = int(max(1, n_ensemble))
 
     def _prepare(self, D):
         D = np.asarray(D, dtype=np.float32)
@@ -86,15 +80,12 @@ class NeuralHurdle(BaseModel):
             self._sd_D[self._sd_D < 1e-6] = 1.0
         return (D - self._mu_D) / self._sd_D
 
-    def fit(self, D, y):
-        torch, nn = _require_torch()
-        torch.manual_seed(self.seed)
-        np.random.seed(self.seed)
+    def _train_one(self, Dn, y, seed):
+        torch, _ = _require_torch()
+        torch.manual_seed(seed)
+        np.random.seed(seed)
 
-        Dn = self._prepare(D)
-        y = np.asarray(y, dtype=np.float32)
         n, p_in = Dn.shape
-
         n_val = max(int(n * self.val_frac), 5)
         n_tr = n - n_val
         if n_tr < 20:
@@ -105,54 +96,48 @@ class NeuralHurdle(BaseModel):
         Xva = torch.from_numpy(Dn[n_tr:])
         yva = torch.from_numpy(y[n_tr:])
 
-        self._module = _MLPHurdleModule(p_in, self.hidden)
-        opt = torch.optim.Adam(self._module.parameters(), lr=self.lr)
+        module = _MLPHurdleModule(p_in, self.hidden)
+        opt = torch.optim.Adam(module.parameters(), lr=self.lr)
 
         def hurdle_nll(logit_pi, log_mu, y_b):
             pi = torch.sigmoid(logit_pi).clamp(1e-6, 1 - 1e-6)
-            mu = torch.exp(log_mu.clamp(-8.0, 8.0))
+            mu = torch.exp(log_mu.clamp(LOG_MU_MIN, LOG_MU_MAX))
             S = (y_b > 0).float()
-
             ll_bin = S * torch.log(pi) + (1 - S) * torch.log(1 - pi)
-
-            # Zero-truncated Poisson log-pmf, computed for every row.
             log_norm = torch.log1p(-torch.exp(-mu).clamp(max=1 - 1e-6))
             log_ztp = (y_b * torch.log(mu + 1e-12) - mu
                        - log_norm - torch.lgamma(y_b + 1))
-
-            # Mask: positive rows contribute log_ztp, zero rows contribute 0.
-            ll_pos = S * log_ztp
-
-            return -(ll_bin + ll_pos).mean()
+            return -(ll_bin + S * log_ztp).mean()
 
         best_val = float("inf")
         best_state = None
         epochs_no_improve = 0
 
         for epoch in range(self.epochs):
-            self._module.net.train()
+            module.net.train()
             perm = torch.randperm(n_tr)
             for i in range(0, n_tr, self.batch):
                 idx = perm[i:i + self.batch]
                 xb, yb = Xtr[idx], ytr[idx]
-                logit_pi, log_mu = self._module(xb)
+                logit_pi, log_mu = module(xb)
                 loss = hurdle_nll(logit_pi, log_mu, yb)
                 opt.zero_grad()
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(module.parameters(), GRAD_CLIP)
                 opt.step()
 
-            self._module.net.eval()
+            module.net.eval()
             with torch.no_grad():
-                logit_pi, log_mu = self._module(Xva)
+                logit_pi, log_mu = module(Xva)
                 val_loss = float(hurdle_nll(logit_pi, log_mu, yva).item())
 
             if val_loss < best_val - 1e-5:
                 best_val = val_loss
                 epochs_no_improve = 0
                 best_state = {
-                    "net": {k: v.clone() for k, v in self._module.net.state_dict().items()},
-                    "head_pi": {k: v.clone() for k, v in self._module.head_pi.state_dict().items()},
-                    "head_mu": {k: v.clone() for k, v in self._module.head_mu.state_dict().items()},
+                    "net":     {k: v.clone() for k, v in module.net.state_dict().items()},
+                    "head_pi": {k: v.clone() for k, v in module.head_pi.state_dict().items()},
+                    "head_mu": {k: v.clone() for k, v in module.head_mu.state_dict().items()},
                 }
             else:
                 epochs_no_improve += 1
@@ -160,22 +145,34 @@ class NeuralHurdle(BaseModel):
                     break
 
         if best_state is not None:
-            self._module.net.load_state_dict(best_state["net"])
-            self._module.head_pi.load_state_dict(best_state["head_pi"])
-            self._module.head_mu.load_state_dict(best_state["head_mu"])
+            module.net.load_state_dict(best_state["net"])
+            module.head_pi.load_state_dict(best_state["head_pi"])
+            module.head_mu.load_state_dict(best_state["head_mu"])
+        return module
 
+    def fit(self, D, y):
+        Dn = self._prepare(D)
+        y = np.asarray(y, dtype=np.float32)
+        self._modules = []
+        for k in range(self.n_ensemble):
+            m = self._train_one(Dn, y, seed=self.seed + 100 * k)
+            self._modules.append(m)
         return self
 
     def _predict_components(self, D):
         torch, _ = _require_torch()
         Dn = self._prepare(D)
-        self._module.net.eval()
-        with torch.no_grad():
-            X = torch.from_numpy(Dn)
-            logit_pi, log_mu = self._module(X)
-            pi = torch.sigmoid(logit_pi).numpy()
-            mu = np.exp(np.clip(log_mu.numpy(), -8.0, 8.0))
-        return pi, mu
+        X = torch.from_numpy(Dn)
+        pis, mus = [], []
+        for m in self._modules:
+            m.net.eval()
+            with torch.no_grad():
+                logit_pi, log_mu = m(X)
+                pi = torch.sigmoid(logit_pi).numpy()
+                mu = np.exp(np.clip(log_mu.numpy(), LOG_MU_MIN, LOG_MU_MAX))
+            pis.append(pi)
+            mus.append(mu)
+        return np.mean(pis, axis=0), np.mean(mus, axis=0)
 
     def predict_mean(self, D):
         pi, mu = self._predict_components(D)
