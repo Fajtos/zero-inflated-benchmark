@@ -1,0 +1,14 @@
+# These are already present in the Lightning AI Studio base image.
+# Listed here for documentation; versions are relaxed to avoid forced downgrades.
+numpy>=1.26
+pandas>=2.2
+scipy>=1.11
+scikit-learn>=1.4
+matplotlib>=3.8
+tqdm>=4.66
+
+# These are installed explicitly.
+statsmodels>=0.14
+xgboost>=2.0
+lightgbm>=4.0
+seaborn>=0.13
